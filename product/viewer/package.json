@@ -1,0 +1,19 @@
+{
+  "name": "screenpipe-viewer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Per-person manager viewer over the central screen-activity store (M4)",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview --port 5174"
+  },
+  "dependencies": {
+    "vue": "^3.5.13"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2.1",
+    "vite": "^6.0.7"
+  }
+}

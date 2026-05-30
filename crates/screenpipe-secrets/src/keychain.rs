@@ -55,6 +55,17 @@ static AVAILABLE: OnceLock<bool> = OnceLock::new();
 /// Check if the OS keychain is available (cached).
 pub fn is_keychain_available() -> bool {
     *AVAILABLE.get_or_init(|| {
+        // Opt-out for headless / fleet agents. The Linux `keyring` write-probe
+        // below can block indefinitely when the OS keyring is locked and no
+        // interactive session can answer the unlock prompt (observed on the
+        // Berlin desktop: a locked gnome-keyring login collection hung
+        // `screenpipe record` at startup before the API ever bound). Secrets
+        // encryption is opt-in and unused by our fleet agent, so treating the
+        // keychain as "unavailable" is the correct, safe answer here.
+        if std::env::var("SCREENPIPE_DISABLE_KEYCHAIN").is_ok() {
+            warn!("keychain: disabled via SCREENPIPE_DISABLE_KEYCHAIN");
+            return false;
+        }
         #[cfg(target_os = "macos")]
         {
             std::process::Command::new("security")

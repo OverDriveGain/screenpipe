@@ -1,0 +1,9 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+sqlalchemy==2.0.36
+asyncpg==0.30.0
+pgvector==0.3.6
+pydantic==2.10.4
+python-multipart==0.0.20
+itsdangerous==2.2.0
+sentence-transformers==3.3.1

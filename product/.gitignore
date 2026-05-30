@@ -1,0 +1,13 @@
+# build / runtime artifacts — never commit
+sync-shim/target/
+central-server/.venv/
+central-server/__pycache__/
+**/__pycache__/
+*.pyc
+.sync-shim-state.json
+
+# The fork ROOT .gitignore ignores all *.py (around line 53). The central server
+# is Python, so re-include the product's own Python sources here. Without this,
+# the fork's blanket `*.py` rule silently drops our app code from `git add`.
+!*.py
+!central-server/app/*.py
