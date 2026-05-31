@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import datetime as dt
 from contextlib import asynccontextmanager
@@ -20,13 +21,16 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from . import config, embedding, operator, retention
+from . import config, embedding, operator, retention, worker
 from .auth import AgentDep
-from .db import Agent, Frame, FrameEmbedding, OcrText, SessionLocal, bootstrap
+from .db import Agent, AudioChunk, Frame, FrameEmbedding, OcrText, SessionLocal, bootstrap
+from .images import make_thumbnail
 from .operator import require_operator
 from .schemas import (
     AgentListResponse,
     AgentSummary,
+    IngestAudioRequest,
+    IngestAudioResponse,
     IngestRequest,
     IngestResponse,
     OperatorLogin,
@@ -35,7 +39,7 @@ from .schemas import (
     TimelineFrame,
     TimelineResponse,
 )
-from .store import store, thumbnail_key
+from .store import audio_key, raw_frame_key, store, thumbnail_key
 
 OperatorDep = Depends(require_operator)
 
@@ -43,7 +47,15 @@ OperatorDep = Depends(require_operator)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await bootstrap()
-    yield
+    # Fat-host processing worker: OCR + embed raw frames (thin-client mode).
+    stop = asyncio.Event()
+    task = asyncio.create_task(worker.run_worker(stop)) if config.WORKER_ENABLED else None
+    try:
+        yield
+    finally:
+        if task is not None:
+            stop.set()
+            await task
 
 
 app = FastAPI(title="screenpipe central", version="0.1.0", lifespan=lifespan)
@@ -125,14 +137,30 @@ async def ingest(req: IngestRequest, agent: Agent = AgentDep):
         for fr in req.frames:
             max_src = fr.frame_id if max_src is None else max(max_src, fr.frame_id)
 
-            # Thumbnail → object store first (so the frame row references a real key).
+            ts = _parse_ts(fr.timestamp)
+            day = ts.date().isoformat() if ts else "unknown"
+
+            # Thin-client raw mode: agent shipped full-res frame bytes and NO OCR.
+            # Store the raw frame, derive the thumbnail here, and queue GPU OCR
+            # (the worker fills ocr_text + embedding). Otherwise legacy fat-client:
+            # store the agent's thumbnail + OCR inline.
+            raw_mode = fr.image_b64 is not None and fr.ocr_text is None
             thumb_key = None
-            if fr.thumbnail_b64:
-                ts = _parse_ts(fr.timestamp)
-                day = (ts.date().isoformat() if ts else "unknown")
-                ext = "jpg" if "jpeg" in fr.thumbnail_mime or "jpg" in fr.thumbnail_mime else "png"
-                thumb_key = thumbnail_key(agent.agent_key, fr.frame_id, day, ext)
-                store.put(thumb_key, base64.b64decode(fr.thumbnail_b64), fr.thumbnail_mime)
+            image_key = None
+            if raw_mode:
+                raw_bytes = base64.b64decode(fr.image_b64)
+                ext = "jpg" if ("jpeg" in fr.image_mime or "jpg" in fr.image_mime) else "png"
+                image_key = raw_frame_key(agent.agent_key, fr.frame_id, day, ext)
+                store.put(image_key, raw_bytes, fr.image_mime)
+                thumb_key = thumbnail_key(agent.agent_key, fr.frame_id, day, "jpg")
+                store.put(thumb_key, make_thumbnail(raw_bytes), "image/jpeg")
+                ocr_status = "pending"
+            else:
+                if fr.thumbnail_b64:
+                    ext = "jpg" if ("jpeg" in fr.thumbnail_mime or "jpg" in fr.thumbnail_mime) else "png"
+                    thumb_key = thumbnail_key(agent.agent_key, fr.frame_id, day, ext)
+                    store.put(thumb_key, base64.b64decode(fr.thumbnail_b64), fr.thumbnail_mime)
+                ocr_status = "done"
 
             # Idempotent insert of the frame; ON CONFLICT DO NOTHING dedups on
             # (agent_id, source_frame_id). RETURNING id tells us if it was new.
@@ -141,7 +169,7 @@ async def ingest(req: IngestRequest, agent: Agent = AgentDep):
                 .values(
                     agent_id=agent.id,
                     source_frame_id=fr.frame_id,
-                    timestamp=_parse_ts(fr.timestamp),
+                    timestamp=ts,
                     app_name=fr.app_name,
                     window_name=fr.window_name,
                     browser_url=fr.browser_url,
@@ -150,6 +178,8 @@ async def ingest(req: IngestRequest, agent: Agent = AgentDep):
                     capture_trigger=fr.capture_trigger,
                     text_source=fr.text_source,
                     thumbnail_key=thumb_key,
+                    image_key=image_key,
+                    ocr_status=ocr_status,
                 )
                 .on_conflict_do_nothing(index_elements=["agent_id", "source_frame_id"])
                 .returning(Frame.id)
@@ -159,10 +189,12 @@ async def ingest(req: IngestRequest, agent: Agent = AgentDep):
                 duplicates += 1
                 continue
 
-            session.add(OcrText(frame_id=new_id, text=fr.ocr_text or ""))
-            vec = embedding.embed(fr.ocr_text or "")
-            if vec is not None:
-                session.add(FrameEmbedding(frame_id=new_id, embedding=vec))
+            # In raw mode the worker creates ocr_text + embedding after GPU OCR.
+            if not raw_mode:
+                session.add(OcrText(frame_id=new_id, text=fr.ocr_text or ""))
+                vec = embedding.embed(fr.ocr_text or "")
+                if vec is not None:
+                    session.add(FrameEmbedding(frame_id=new_id, embedding=vec))
             accepted += 1
 
         agent_row = await session.get(Agent, agent.id)
@@ -176,6 +208,51 @@ async def ingest(req: IngestRequest, agent: Agent = AgentDep):
         ).scalar()
 
     return IngestResponse(accepted=accepted, duplicates=duplicates, max_source_frame_id=max_stored)
+
+
+@app.post("/ingest-audio", response_model=IngestAudioResponse)
+async def ingest_audio(req: IngestAudioRequest, agent: Agent = AgentDep):
+    """Thin-client raw-audio ingest. Store each raw mp4 chunk; the ASR worker
+    transcribes it on the GPU (faster-whisper) + embeds the transcript."""
+    if req.agent_id != agent.agent_key:
+        raise HTTPException(403, "agent_id does not match token identity")
+
+    accepted = 0
+    duplicates = 0
+    async with SessionLocal() as session:
+        for ch in req.chunks:
+            ts = _parse_ts(ch.timestamp)
+            day = ts.date().isoformat() if ts else "unknown"
+            akey = audio_key(agent.agent_key, ch.chunk_id, day, "mp4")
+            store.put(akey, base64.b64decode(ch.audio_b64), ch.audio_mime)
+            stmt = (
+                pg_insert(AudioChunk)
+                .values(
+                    agent_id=agent.id,
+                    source_chunk_id=ch.chunk_id,
+                    timestamp=ts,
+                    audio_key=akey,
+                    asr_status="pending",
+                )
+                .on_conflict_do_nothing(index_elements=["agent_id", "source_chunk_id"])
+                .returning(AudioChunk.id)
+            )
+            new_id = (await session.execute(stmt)).scalar_one_or_none()
+            if new_id is None:
+                duplicates += 1
+            else:
+                accepted += 1
+
+        agent_row = await session.get(Agent, agent.id)
+        agent_row.last_seen_at = dt.datetime.now(dt.timezone.utc)
+        await session.commit()
+        max_stored = (
+            await session.execute(
+                select(func.max(AudioChunk.source_chunk_id)).where(AudioChunk.agent_id == agent.id)
+            )
+        ).scalar()
+
+    return IngestAudioResponse(accepted=accepted, duplicates=duplicates, max_source_chunk_id=max_stored)
 
 
 @app.get("/search", response_model=SearchResponse)

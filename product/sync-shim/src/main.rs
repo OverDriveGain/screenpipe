@@ -16,6 +16,7 @@
 use anyhow::{Context, Result};
 use base64::Engine as _;
 use clap::Parser;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -67,11 +68,41 @@ struct Args {
     /// HTTP request timeout seconds.
     #[arg(long, env = "SHIM_HTTP_TIMEOUT", default_value_t = 60)]
     http_timeout: u64,
+
+    /// Thin-client raw mode: ship the full-res frame bytes (image_b64) and let
+    /// the FAT central do OCR + thumbnail derivation. Omits on-agent OCR text and
+    /// thumbnail downscaling — the agent stays dumb (capture only).
+    #[arg(long, env = "SHIM_RAW", default_value_t = false)]
+    raw: bool,
 }
 
 #[derive(Serialize, Deserialize, Default)]
 struct State {
     last_synced_frame_id: i64,
+    /// Second cursor: agent audio_chunks.id, advanced independently of frames.
+    #[serde(default)]
+    last_synced_audio_chunk_id: i64,
+}
+
+#[derive(Serialize)]
+struct AudioChunkOut {
+    chunk_id: i64,
+    timestamp: Option<String>,
+    audio_b64: String,
+    audio_mime: String,
+}
+
+#[derive(Serialize)]
+struct IngestAudioRequest<'a> {
+    agent_id: &'a str,
+    chunks: Vec<AudioChunkOut>,
+}
+
+#[derive(Deserialize, Debug)]
+struct IngestAudioResponse {
+    accepted: i64,
+    duplicates: i64,
+    max_source_chunk_id: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -85,10 +116,16 @@ struct FrameOut {
     monitor: Option<String>,
     capture_trigger: Option<String>,
     text_source: Option<String>,
-    ocr_text: String,
+    // Fat-client mode only. In raw mode this is omitted so the central OCRs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ocr_text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     thumbnail_b64: Option<String>,
     thumbnail_mime: String,
+    // Thin-client raw mode: full-res frame bytes for the central to OCR.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_b64: Option<String>,
+    image_mime: String,
 }
 
 #[derive(Serialize)]
@@ -161,6 +198,14 @@ fn make_thumbnail(path: &str, width: u32, quality: u8) -> Option<String> {
     Some(base64::engine::general_purpose::STANDARD.encode(&buf))
 }
 
+/// Read a snapshot file as base64 (raw full-res frame for thin-client mode). The
+/// agent already wrote the JPEG to disk; we ship it verbatim, no decode/re-encode.
+/// None if the snapshot is missing — a missing image must not block the cursor.
+fn read_raw_b64(path: &str) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    Some(base64::engine::general_purpose::STANDARD.encode(&bytes))
+}
+
 struct PendingFrame {
     id: i64,
     out: FrameOut,
@@ -173,6 +218,7 @@ fn fetch_batch(
     limit: usize,
     thumb_width: u32,
     thumb_quality: u8,
+    raw: bool,
 ) -> Result<Vec<PendingFrame>> {
     let mut stmt = conn.prepare(
         "SELECT f.id, f.timestamp, f.app_name, f.window_name, f.browser_url, f.focused, \
@@ -224,9 +270,17 @@ fn fetch_batch(
             ocr_text,
             monitor,
         ) = r?;
-        let thumbnail_b64 = snapshot_path
-            .as_deref()
-            .and_then(|p| make_thumbnail(p, thumb_width, thumb_quality));
+        // Raw mode: ship the full-res frame, no OCR text, no thumbnail (the
+        // central derives the thumbnail and OCRs). Fat-client mode: ship OCR
+        // text + a downscaled thumbnail as before.
+        let (image_b64, thumbnail_b64, ocr_out) = if raw {
+            (snapshot_path.as_deref().and_then(read_raw_b64), None, None)
+        } else {
+            let thumb = snapshot_path
+                .as_deref()
+                .and_then(|p| make_thumbnail(p, thumb_width, thumb_quality));
+            (None, thumb, Some(ocr_text))
+        };
         out.push(PendingFrame {
             id,
             out: FrameOut {
@@ -239,9 +293,11 @@ fn fetch_batch(
                 monitor,
                 capture_trigger,
                 text_source,
-                ocr_text,
+                ocr_text: ocr_out,
                 thumbnail_b64,
                 thumbnail_mime: "image/jpeg".to_string(),
+                image_b64,
+                image_mime: "image/jpeg".to_string(),
             },
         });
     }
@@ -260,6 +316,78 @@ fn extract_monitor(path: &String) -> Option<String> {
     }
 }
 
+/// Read up to `limit` audio chunks with id > after, shipping the raw mp4 bytes.
+/// Returns (chunks_to_send, highest_id_seen). Unreadable files are skipped but
+/// still advance the cursor (highest_id) so a missing chunk never blocks sync.
+fn fetch_audio_batch(
+    conn: &rusqlite::Connection,
+    after: i64,
+    limit: usize,
+) -> Result<(Vec<AudioChunkOut>, Option<i64>)> {
+    let mut stmt = conn.prepare(
+        "SELECT id, timestamp, file_path FROM audio_chunks \
+         WHERE id > ?1 ORDER BY id ASC LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![after, limit as i64], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    let mut highest = None;
+    for r in rows {
+        let (id, timestamp, file_path) = r?;
+        highest = Some(id);
+        match file_path.as_deref().map(std::fs::read) {
+            Some(Ok(bytes)) => out.push(AudioChunkOut {
+                chunk_id: id,
+                timestamp,
+                audio_b64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                audio_mime: "audio/mp4".to_string(),
+            }),
+            _ => log::warn!("audio chunk {} file missing/unreadable, skipping bytes", id),
+        }
+    }
+    Ok((out, highest))
+}
+
+/// Ship raw audio chunks to the central /ingest-audio (raw mode only).
+fn sync_audio(
+    args: &Args,
+    client: &reqwest::blocking::Client,
+    conn: &rusqlite::Connection,
+    state: &mut State,
+    sp: &Path,
+) -> Result<()> {
+    let audio_url = format!("{}/ingest-audio", args.central_url.trim_end_matches('/'));
+    loop {
+        let (chunks, highest) =
+            fetch_audio_batch(conn, state.last_synced_audio_chunk_id, args.batch_size)?;
+        let highest = match highest {
+            Some(h) => h,
+            None => {
+                log::info!("audio up to date at chunk id {}", state.last_synced_audio_chunk_id);
+                break;
+            }
+        };
+        if !chunks.is_empty() {
+            let count = chunks.len();
+            let req = IngestAudioRequest { agent_id: &args.agent_id, chunks };
+            let resp: IngestAudioResponse =
+                post_with_backoff(client, &audio_url, &args.token, &req)?;
+            log::info!(
+                "ingested {} audio chunks (accepted={}, dup={}, central_max={:?}) up to chunk id {}",
+                count, resp.accepted, resp.duplicates, resp.max_source_chunk_id, highest
+            );
+        }
+        state.last_synced_audio_chunk_id = highest;
+        save_state(sp, state)?;
+    }
+    Ok(())
+}
+
 fn sync_once(args: &Args, client: &reqwest::blocking::Client, state: &mut State) -> Result<()> {
     let conn = open_db_readonly(&args.data_dir)?;
     let sp = state_path(args);
@@ -272,6 +400,7 @@ fn sync_once(args: &Args, client: &reqwest::blocking::Client, state: &mut State)
             args.batch_size,
             args.thumb_width,
             args.thumb_quality,
+            args.raw,
         )?;
         if batch.is_empty() {
             log::info!(
@@ -290,7 +419,7 @@ fn sync_once(args: &Args, client: &reqwest::blocking::Client, state: &mut State)
         };
 
         // Retry/backoff: idempotent ingest means a retried batch is safe.
-        let resp = post_with_backoff(client, &ingest_url, &args.token, &req)?;
+        let resp: IngestResponse = post_with_backoff(client, &ingest_url, &args.token, &req)?;
         log::info!(
             "ingested {} frames (accepted={}, dup={}, central_max={:?}) up to local id {}",
             count,
@@ -303,15 +432,21 @@ fn sync_once(args: &Args, client: &reqwest::blocking::Client, state: &mut State)
         state.last_synced_frame_id = highest;
         save_state(&sp, state)?;
     }
+
+    // Thin-client raw mode also ships raw audio chunks (second cursor) for the
+    // central to transcribe on the GPU. Fat-client mode leaves audio on the agent.
+    if args.raw {
+        sync_audio(args, client, &conn, state, &sp)?;
+    }
     Ok(())
 }
 
-fn post_with_backoff(
+fn post_with_backoff<T: Serialize, R: DeserializeOwned>(
     client: &reqwest::blocking::Client,
     url: &str,
     token: &str,
-    req: &IngestRequest,
-) -> Result<IngestResponse> {
+    req: &T,
+) -> Result<R> {
     let mut attempt = 0u32;
     loop {
         attempt += 1;
@@ -322,7 +457,7 @@ fn post_with_backoff(
             .send();
         match res {
             Ok(r) if r.status().is_success() => {
-                return Ok(r.json::<IngestResponse>()?);
+                return Ok(r.json::<R>()?);
             }
             Ok(r) => {
                 let status = r.status();

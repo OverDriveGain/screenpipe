@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Optional
 
 from . import config
 
@@ -67,6 +68,30 @@ def build_store() -> ObjectStore:
 
 def thumbnail_key(agent_key: str, source_frame_id: int, timestamp_date: str, ext: str = "jpg") -> str:
     return f"{agent_key}/{timestamp_date}/{source_frame_id}.{ext}"
+
+
+def raw_frame_key(agent_key: str, source_frame_id: int, timestamp_date: str, ext: str = "jpg") -> str:
+    """Object key for the RAW full-res frame (thin-client mode). Kept under a
+    `raw/` prefix so retention/nginx can treat raw frames separately from the
+    small thumbnails served to the viewer."""
+    return f"raw/{agent_key}/{timestamp_date}/{source_frame_id}.{ext}"
+
+
+def audio_key(agent_key: str, source_chunk_id: int, timestamp_date: str, ext: str = "mp4") -> str:
+    """Object key for a raw audio chunk (thin-client mode)."""
+    return f"audio/{agent_key}/{timestamp_date}/{source_chunk_id}.{ext}"
+
+
+def get_bytes(key: str) -> Optional[bytes]:
+    """Read an object's bytes back (the worker needs the raw frame to OCR).
+    Only meaningful for the fs backend in v1."""
+    if isinstance(store, FsObjectStore):
+        dest = store.root / key
+        try:
+            return dest.read_bytes()
+        except FileNotFoundError:
+            return None
+    raise NotImplementedError("get_bytes not implemented for this backend")
 
 
 store = build_store()

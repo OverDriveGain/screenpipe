@@ -22,9 +22,18 @@ class FrameIn(BaseModel):
     monitor: Optional[str] = Field(None, description="monitor id, e.g. '596'")
     capture_trigger: Optional[str] = None
     text_source: Optional[str] = None
-    ocr_text: Optional[str] = ""
+    ocr_text: Optional[str] = Field(
+        None,
+        description="OCR text (fat-client). In thin-client raw mode this is omitted "
+        "and the central OCRs image_b64 itself.",
+    )
     thumbnail_b64: Optional[str] = Field(None, description="base64 thumbnail bytes; omit if none")
     thumbnail_mime: str = "image/jpeg"
+    # Thin-client raw mode: agent ships full-res frame bytes and NO OCR. When
+    # image_b64 is present and ocr_text is None, the central stores the raw
+    # frame, derives the thumbnail itself, and queues GPU OCR (ocr_status=pending).
+    image_b64: Optional[str] = Field(None, description="base64 full-res frame bytes (thin-client raw mode)")
+    image_mime: str = "image/jpeg"
 
 
 class IngestRequest(BaseModel):
@@ -36,6 +45,26 @@ class IngestResponse(BaseModel):
     accepted: int = Field(..., description="frames newly stored")
     duplicates: int = Field(..., description="frames already present (idempotent skip)")
     max_source_frame_id: Optional[int] = Field(None, description="largest source_frame_id now stored for this agent")
+
+
+class AudioChunkIn(BaseModel):
+    """One raw audio chunk as the shim sends it (thin-client mode)."""
+
+    chunk_id: int = Field(..., description="agent-local audio_chunks.id (dedup key + audio cursor)")
+    timestamp: Optional[str] = None
+    audio_b64: str = Field(..., description="base64 raw mp4 bytes")
+    audio_mime: str = "audio/mp4"
+
+
+class IngestAudioRequest(BaseModel):
+    agent_id: str
+    chunks: list[AudioChunkIn]
+
+
+class IngestAudioResponse(BaseModel):
+    accepted: int
+    duplicates: int
+    max_source_chunk_id: Optional[int] = None
 
 
 class SearchHit(BaseModel):

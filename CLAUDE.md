@@ -37,7 +37,19 @@ vendored upstream crates.
   Manar's legal liability. Capture + sync + central + viewer is the product. Detection-evasion is
   NOT.
 - **Agent = fork-built `screenpipe` binary, not the GUI.** The GUI is desktop preview only.
-- **OCR happens on the agent.** The sync shim ships text + thumbnails, never raw video.
+- **THIN-CLIENT / FAT-HOST (Manar 2026-05-30, supersedes the earlier OCR-on-agent
+  decision).** The agent does NO heavy compute: no ASR (done — `record
+  --audio-transcription-engine disabled` keeps raw audio capture, drops STT;
+  reclaimed ~74%→8.7% of a core on the desktop), and the target is NO OCR / NO
+  embedding / NO PII redaction on the client either. **ALL processing (OCR, ASR,
+  embedding, indexing, PII redaction) runs on the central host.** Audio is still
+  CAPTURED on the client (Manar wants audio), just not transcribed there. The sync
+  shim ships **raw frames + raw audio**, NOT OCR text + thumbnails. See
+  `product/docs/thin-client-fat-host.md` — this reshapes M1 (central is now a
+  processing host) and M2 (raw-artifact pusher, two cursors). NOTE: OCR has no
+  flag to disable while keeping frames (it's a11y-driven in `paired_capture.rs`);
+  truly OCR-free client needs a small source gate — deferred, harmless at ~0.06
+  fps until the M2 raw rework.
 
 ## Roadmap
 

@@ -81,6 +81,15 @@ class Frame(Base):
     text_source: Mapped[Optional[str]] = mapped_column(String(64))
     # Object-store key for the thumbnail (store.py builds the URL).
     thumbnail_key: Mapped[Optional[str]] = mapped_column(Text)
+    # Object-store key for the RAW full-res frame (thin-client mode). The
+    # processing worker reads this to OCR. NULL for legacy fat-client ingest.
+    image_key: Mapped[Optional[str]] = mapped_column(Text)
+    # OCR processing state for the fat-host worker:
+    #   'done'    — OCR text present (legacy inline ingest, or worker finished).
+    #   'pending' — raw frame stored, worker has not OCR'd it yet.
+    #   'skipped' — OCR_BACKEND=none.
+    #   'error'   — OCR failed (worker logs; left for retry/inspection).
+    ocr_status: Mapped[str] = mapped_column(String(16), default="done", server_default="done")
     ingested_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     ocr: Mapped[Optional["OcrText"]] = relationship(back_populates="frame", cascade="all, delete-orphan", uselist=False)
@@ -106,6 +115,43 @@ class FrameEmbedding(Base):
     embedding: Mapped[Optional[list[float]]] = mapped_column(Vector(config.EMBEDDING_DIM))
 
     frame: Mapped["Frame"] = relationship(back_populates="embedding")
+
+
+class AudioChunk(Base):
+    """One raw audio chunk (mp4) shipped by the agent. The ASR worker transcribes
+    it on the GPU (faster-whisper) into AudioTranscription. Mirrors Frame."""
+
+    __tablename__ = "audio_chunks"
+    __table_args__ = (
+        UniqueConstraint("agent_id", "source_chunk_id", name="uq_audio_agent_source"),
+        Index("ix_audio_agent_ts", "agent_id", "timestamp"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    agent_id: Mapped[int] = mapped_column(ForeignKey("agents.id", ondelete="CASCADE"), index=True)
+    # The agent's local audio_chunks.id — the dedup key + the audio sync cursor.
+    source_chunk_id: Mapped[int] = mapped_column(BigInteger)
+    timestamp: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), index=True)
+    # Object-store key for the raw mp4 (the worker reads this to transcribe).
+    audio_key: Mapped[Optional[str]] = mapped_column(Text)
+    # 'pending' | 'done' | 'error' | 'skipped'
+    asr_status: Mapped[str] = mapped_column(String(16), default="pending", server_default="pending")
+    ingested_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    transcription: Mapped[Optional["AudioTranscription"]] = relationship(
+        back_populates="chunk", cascade="all, delete-orphan", uselist=False
+    )
+
+
+class AudioTranscription(Base):
+    __tablename__ = "audio_transcriptions"
+
+    chunk_id: Mapped[int] = mapped_column(ForeignKey("audio_chunks.id", ondelete="CASCADE"), primary_key=True)
+    text: Mapped[str] = mapped_column(Text, default="")
+    # tsv generated tsvector column added in bootstrap() — NOT mapped (generated).
+    embedding: Mapped[Optional[list[float]]] = mapped_column(Vector(config.EMBEDDING_DIM))
+
+    chunk: Mapped["AudioChunk"] = relationship(back_populates="transcription")
 
 
 # Raw DDL run after create_all: pgvector extension, tsvector generated column,
@@ -138,6 +184,31 @@ _BOOTSTRAP_SQL = [
     END $$;
     """,
     "CREATE INDEX IF NOT EXISTS ix_ocr_tsv ON ocr_text USING GIN (tsv)",
+    # Thin-client columns (added idempotently so existing DBs upgrade in place;
+    # create_all only creates missing TABLES, never missing COLUMNS).
+    "ALTER TABLE frames ADD COLUMN IF NOT EXISTS image_key text",
+    "ALTER TABLE frames ADD COLUMN IF NOT EXISTS ocr_status varchar(16) NOT NULL DEFAULT 'done'",
+    # Worker queue: a partial index over just the pending rows keeps the
+    # "next batch to OCR" scan cheap as the table grows.
+    "CREATE INDEX IF NOT EXISTS ix_frames_pending ON frames (id) WHERE ocr_status = 'pending'",
+    # Audio transcript FTS: same generated-tsvector pattern as ocr_text.
+    f"""
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name='audio_transcriptions' AND column_name='tsv'
+              AND is_generated='ALWAYS'
+      ) THEN
+        ALTER TABLE audio_transcriptions DROP COLUMN IF EXISTS tsv;
+        ALTER TABLE audio_transcriptions
+          ADD COLUMN tsv tsvector
+          GENERATED ALWAYS AS (to_tsvector('{_FTS_LANG}', coalesce(text,''))) STORED;
+      END IF;
+    END $$;
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_audio_tsv ON audio_transcriptions USING GIN (tsv)",
+    "CREATE INDEX IF NOT EXISTS ix_audio_pending ON audio_chunks (id) WHERE asr_status = 'pending'",
     # Drop any legacy ivfflat index: ivfflat partitions vectors into `lists` cells
     # and probes only a few, so on a small/sparse corpus it silently misses rows
     # (returns 0 hits). We do EXACT cosine scan instead — correct at this corpus

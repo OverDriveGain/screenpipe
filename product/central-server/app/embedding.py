@@ -42,6 +42,32 @@ def _load():
     return _model
 
 
+def _ollama_encode(text: str) -> list[float]:
+    """GPU embedding via an ollama server (EMBEDDING_BACKEND=ollama).
+
+    ollama runs the model (e.g. bge-m3) on the GPU and returns the vector over
+    HTTP. We normalise to a unit vector here so cosine search matches the
+    sentence-transformers path (which uses normalize_embeddings=True). Uses
+    stdlib urllib so the central image needs no extra dependency.
+    """
+    import json
+    import math
+    import urllib.request
+
+    body = json.dumps(
+        {"model": config.EMBEDDING_OLLAMA_MODEL, "prompt": text}
+    ).encode()
+    req = urllib.request.Request(
+        f"{config.EMBEDDING_OLLAMA_URL.rstrip('/')}/api/embeddings",
+        data=body,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=config.EMBEDDING_OLLAMA_TIMEOUT) as resp:
+        vec = json.loads(resp.read()).get("embedding") or []
+    norm = math.sqrt(sum(x * x for x in vec))
+    return [x / norm for x in vec] if norm else vec
+
+
 def _encode(text: str, prefix: str) -> Optional[list[float]]:
     if config.EMBEDDING_DISABLED:
         return None
@@ -51,6 +77,8 @@ def _encode(text: str, prefix: str) -> Optional[list[float]]:
     text = text[: config.EMBEDDING_MAX_CHARS]
     if config.EMBEDDING_E5_PREFIX:
         text = f"{prefix}{text}"
+    if config.EMBEDDING_BACKEND == "ollama":
+        return _ollama_encode(text)
     model = _load()
     vec = model.encode(text, normalize_embeddings=True)
     return vec.tolist()

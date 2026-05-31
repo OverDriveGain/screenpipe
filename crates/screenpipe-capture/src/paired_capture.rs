@@ -174,8 +174,12 @@ pub async fn paired_capture(
             .map(|s| a11y_content_is_thin(s, ctx.window_name, ctx.browser_url, ctx.app_name))
             .unwrap_or(false);
 
+    // Thin-client agents set SCREENPIPE_DISABLE_OCR=1 to skip ALL on-device OCR —
+    // the JPEG snapshot is still written above, and the central (fat host) re-OCRs
+    // the raw frame. This drops the per-frame Tesseract CPU cost on the agent.
+    let ocr_disabled = std::env::var("SCREENPIPE_DISABLE_OCR").is_ok();
     // Run OCR when: no a11y text, app prefers OCR, OR a11y text is thin (hybrid)
-    let (ocr_text, ocr_text_json) = if !has_accessibility_text || a11y_is_thin {
+    let (ocr_text, ocr_text_json) = if !ocr_disabled && (!has_accessibility_text || a11y_is_thin) {
         // Windows native OCR is async, so call it directly (not inside spawn_blocking)
         #[cfg(target_os = "windows")]
         let raw = {

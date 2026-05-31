@@ -329,8 +329,13 @@ impl SCServer {
         let listener = bind_listener(self.addr).await?;
         info!("Server listening on {}", self.addr);
 
-        // Advertise via mDNS
-        if let Err(e) = screenpipe_connect::mdns::advertise(self.addr.port()) {
+        // Advertise via mDNS. Skippable for headless fleet agents that don't need
+        // LAN discovery (employees reach the central over HTTPS+token, not mDNS).
+        // The mdns-sd ServiceDaemon thread has been observed busy-looping at
+        // 65-90% of a core on Linux, so the fleet agent sets SCREENPIPE_DISABLE_MDNS=1.
+        if std::env::var("SCREENPIPE_DISABLE_MDNS").is_ok() {
+            tracing::info!("mdns: disabled via SCREENPIPE_DISABLE_MDNS");
+        } else if let Err(e) = screenpipe_connect::mdns::advertise(self.addr.port()) {
             tracing::warn!("mdns advertisement failed (non-fatal): {}", e);
         }
 
