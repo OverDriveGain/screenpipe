@@ -1,0 +1,6 @@
+# runtime artifacts — never commit
+*.log
+*.progress.json
+state.db
+*.lock
+__pycache__/

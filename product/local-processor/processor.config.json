@@ -1,0 +1,29 @@
+{
+  "_comment": "screenpipe local buffered processor. All caps are IN-CODE (no systemd dependency). Times are LOCAL.",
+
+  "db": "/mnt/data/screenpipe-agent/db.sqlite",
+  "whisper_url": "http://10.10.0.2:9000/v1/audio/transcriptions",
+
+  "tasks": {
+    "a11y_harvest": { "enabled": true },
+    "audio":        { "enabled": true, "silence_bytes": 6000, "settle_seconds": 150 },
+    "ocr":          { "enabled": true, "lang": "eng", "settle_seconds": 150,
+                      "video_extract": true, "video_extract_only_in_catchup": true }
+  },
+
+  "throttle": {
+    "default_profile": "trickle",
+    "profiles": {
+      "trickle": { "audio_concurrency": 1, "audio_rps": 1.5, "ocr_concurrency": 1, "ocr_rps": 1.0, "max_loadavg": 18.0 },
+      "catchup": { "audio_concurrency": 3, "audio_rps": 8.0, "ocr_concurrency": 3, "ocr_rps": 4.0, "max_loadavg": 21.0 }
+    },
+    "schedule": [
+      { "start": "01:00", "end": "07:00", "profile": "catchup" }
+    ],
+    "catchup_if_backlog_over": 30000,
+    "cpu_guard_sleep": 2.0
+  },
+
+  "loop_idle_seconds": 20,
+  "ocr_max_attempts": 2
+}
