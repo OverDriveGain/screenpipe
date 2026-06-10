@@ -142,12 +142,31 @@ def _collapse(t):
     t=re.sub(r'\b([\w\']{1,8})(,?\s+\1\b){3,}', r'\1 \1', t)
     return t.strip()
 
-def _audio_one(url, fp, silence_bytes):
+_VOL_RE = re.compile(r'max_volume:\s*(-?[\d.]+)')
+def _max_volume_db(fp):
+    """Cheap local loudness probe (ffmpeg volumedetect). Returns peak dBFS, or None on error.
+    Speech peaks ~ -20dB; a mic/line noise floor peaks ~ -50dB; digital silence ~ -91dB."""
+    try:
+        p=subprocess.run(["nice","-n","19","ionice","-c3","ffmpeg","-hide_banner","-i",fp,
+                          "-af","volumedetect","-f","null","-"],
+                         capture_output=True, text=True, timeout=30)
+        m=_VOL_RE.search(p.stderr)
+        return float(m.group(1)) if m else None
+    except Exception:
+        return None
+
+def _audio_one(url, fp, silence_bytes, silence_db):
     # returns (status, text|None, reason|None); status in store/silent/error
     if not fp or not os.path.exists(fp): return ('error', None, 'missing')
     try:
-        if os.path.getsize(fp) < silence_bytes: return ('silent', None, None)
+        if os.path.getsize(fp) < silence_bytes: return ('silent', None, None)   # cheap size pre-screen
     except OSError as e: return ('error', None, f'stat {e}')
+    # ENERGY GATE: big files can still be pure noise-floor (continuous mic/line capture, no speech).
+    # Probe loudness locally; below the speech threshold -> silent, NEVER hit whisper. This is what
+    # stops whisper being flooded by ~180KB noise chunks that pass the size screen.
+    if silence_db is not None:
+        mv=_max_volume_db(fp)
+        if mv is not None and mv < silence_db: return ('silent', None, None)
     j=_whisper(url, fp, vad=True)
     if j is not None:
         t=(j.get("text") or "").strip()
@@ -161,7 +180,7 @@ def _dev(fp):
     f=os.path.basename(fp or ""); name=f.split(".analog")[0] if ".analog" in f else f
     return name[:80], (1 if "(input)" in f else 0)
 
-def task_audio(db, thr, prof, url, silence_bytes, settle_seconds, batch=200, max_attempts=3):
+def task_audio(db, thr, prof, url, silence_bytes, silence_db, settle_seconds, batch=200, max_attempts=3):
     cutoff = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time()-settle_seconds))
     r = ro(db)
     rows = r.execute(f"""select id,file_path,timestamp from audio_chunks
@@ -175,7 +194,7 @@ def task_audio(db, thr, prof, url, silence_bytes, settle_seconds, batch=200, max
         for row in rows:
             if thr.stop: break
             thr.cpu_gate(prof["max_loadavg"]); thr.rate_gate("audio", prof["audio_rps"])
-            futs[ex.submit(_audio_one, url, row[1], silence_bytes)] = row
+            futs[ex.submit(_audio_one, url, row[1], silence_bytes, silence_db)] = row
         for fut in futs:
             out.append((futs[fut],)+fut.result())
     store=silent=err=0
@@ -317,7 +336,7 @@ def main():
         if run("a11y_harvest"):
             n=task_a11y_harvest(db); tot["a11y"]+=n; did+=n
         if run("audio") and not thr.stop:
-            s,si,e=task_audio(db,thr,prof,url,tcfg["audio"]["silence_bytes"],tcfg["audio"]["settle_seconds"])
+            s,si,e=task_audio(db,thr,prof,url,tcfg["audio"]["silence_bytes"],tcfg["audio"].get("silence_db",-40.0),tcfg["audio"]["settle_seconds"])
             tot["audio_store"]+=s; tot["audio_silent"]+=si; tot["audio_err"]+=e; did+=s+si+e
         if run("ocr") and not thr.stop:
             oc=tcfg["ocr"]; ve=oc.get("video_extract",False) and (prof_name=="catchup" or not oc.get("video_extract_only_in_catchup",True))
