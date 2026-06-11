@@ -155,7 +155,32 @@ def _max_volume_db(fp):
     except Exception:
         return None
 
-def _audio_one(url, fp, silence_bytes, silence_db):
+_DUR_RE = re.compile(r'Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)')
+_SILDUR_RE = re.compile(r'silence_duration:\s*([\d.]+)')
+def _voiced_seconds(fp, noise_db):
+    """Local VAD pre-gate (ffmpeg silencedetect). Returns the number of seconds of NON-silent
+    audio in the chunk = total duration minus summed silence runs. This discriminates the
+    continuously-captured Focusrite Scarlett OUTPUT (always silent -> voiced=0) from the RØDE
+    mic INPUT (real voice -> voiced>0) so silent chunks never pay a whisper round-trip.
+    Pinned to 1 thread (cheap, ~0.14s wall). Returns None if duration can't be parsed
+    (corrupt/missing) so the caller FALLS THROUGH to whisper — never drop real audio on a
+    parse failure."""
+    try:
+        p=subprocess.run(["nice","-n","19","ionice","-c3","ffmpeg","-threads","1","-hide_banner",
+                          "-nostats","-i",fp,"-af",f"silencedetect=noise={noise_db}:d=0.5",
+                          "-f","null","-"],
+                         capture_output=True, text=True, timeout=60)
+    except Exception:
+        return None
+    m=_DUR_RE.search(p.stderr)
+    if not m:
+        return None                                    # unknown duration -> fall through to whisper
+    h,mn,sec=int(m.group(1)),int(m.group(2)),float(m.group(3))
+    duration=h*3600+mn*60+sec
+    total_silence=sum(float(x) for x in _SILDUR_RE.findall(p.stderr))
+    return max(0.0, duration-total_silence)
+
+def _audio_one(url, fp, silence_bytes, silence_db, min_voiced_seconds, silence_noise_db):
     # returns (status, text|None, reason|None); status in store/silent/error
     if not fp or not os.path.exists(fp): return ('error', None, 'missing')
     try:
@@ -167,6 +192,13 @@ def _audio_one(url, fp, silence_bytes, silence_db):
     if silence_db is not None:
         mv=_max_volume_db(fp)
         if mv is not None and mv < silence_db: return ('silent', None, None)
+    # VAD PRE-GATE: ffmpeg silencedetect measures how many seconds are actually voiced. If a chunk
+    # has less than min_voiced_seconds of real speech (e.g. the always-silent Scarlett output, or a
+    # chunk with only a stray click), mark it silent locally and NEVER hit whisper. None duration =>
+    # parse failure => fall through to whisper rather than risk dropping real audio.
+    if min_voiced_seconds is not None and min_voiced_seconds > 0:
+        vs=_voiced_seconds(fp, silence_noise_db)
+        if vs is not None and vs < min_voiced_seconds: return ('silent', None, None)
     j=_whisper(url, fp, vad=True)
     if j is not None:
         t=(j.get("text") or "").strip()
@@ -180,7 +212,7 @@ def _dev(fp):
     f=os.path.basename(fp or ""); name=f.split(".analog")[0] if ".analog" in f else f
     return name[:80], (1 if "(input)" in f else 0)
 
-def task_audio(db, thr, prof, url, silence_bytes, silence_db, settle_seconds, batch=200, max_attempts=3):
+def task_audio(db, thr, prof, url, silence_bytes, silence_db, min_voiced_seconds, silence_noise_db, settle_seconds, batch=200, max_attempts=3):
     cutoff = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time()-settle_seconds))
     r = ro(db)
     rows = r.execute(f"""select id,file_path,timestamp from audio_chunks
@@ -194,7 +226,7 @@ def task_audio(db, thr, prof, url, silence_bytes, silence_db, settle_seconds, ba
         for row in rows:
             if thr.stop: break
             thr.cpu_gate(prof["max_loadavg"]); thr.rate_gate("audio", prof["audio_rps"])
-            futs[ex.submit(_audio_one, url, row[1], silence_bytes, silence_db)] = row
+            futs[ex.submit(_audio_one, url, row[1], silence_bytes, silence_db, min_voiced_seconds, silence_noise_db)] = row
         for fut in futs:
             out.append((futs[fut],)+fut.result())
     store=silent=err=0
@@ -336,7 +368,9 @@ def main():
         if run("a11y_harvest"):
             n=task_a11y_harvest(db); tot["a11y"]+=n; did+=n
         if run("audio") and not thr.stop:
-            s,si,e=task_audio(db,thr,prof,url,tcfg["audio"]["silence_bytes"],tcfg["audio"].get("silence_db",-40.0),tcfg["audio"]["settle_seconds"])
+            s,si,e=task_audio(db,thr,prof,url,tcfg["audio"]["silence_bytes"],tcfg["audio"].get("silence_db",-40.0),
+                              tcfg["audio"].get("min_voiced_seconds",5.0),tcfg["audio"].get("silence_noise_db","-30dB"),
+                              tcfg["audio"]["settle_seconds"])
             tot["audio_store"]+=s; tot["audio_silent"]+=si; tot["audio_err"]+=e; did+=s+si+e
         if run("ocr") and not thr.stop:
             oc=tcfg["ocr"]; ve=oc.get("video_extract",False) and (prof_name=="catchup" or not oc.get("video_extract_only_in_catchup",True))
