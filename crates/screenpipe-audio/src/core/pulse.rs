@@ -335,6 +335,21 @@ fn create_pulse_record_stream(
         ));
     }
 
+    // Explicit record buffer attributes. With `None` (PulseAudio default), the server picks a
+    // large `fragsize` and delivers captured audio in big, infrequent bursts — so the 50ms
+    // blocking `read()` in the capture loop returns ~170ms apart. The SourceBuffer then mistakes
+    // that wall-clock spacing for *lost* audio and pads ~70% digital silence, gutting recordings
+    // (e.g. a meeting captured as 30% speech / 70% silence). A small `fragsize` makes the server
+    // hand us ~50ms fragments continuously, so reads return on cadence and no false gaps occur.
+    let bytes_per_50ms = (sample_rate * channels as u32 * std::mem::size_of::<f32>() as u32) / 20;
+    let buffer_attr = pulse::def::BufferAttr {
+        maxlength: bytes_per_50ms.saturating_mul(20), // ~1s of headroom against read jitter
+        tlength: u32::MAX,                            // playback-only, ignored for record
+        prebuf: u32::MAX,                             // playback-only, ignored for record
+        minreq: u32::MAX,                             // playback-only, ignored for record
+        fragsize: bytes_per_50ms,                     // ~50ms fragments → continuous low-jitter reads
+    };
+
     let simple = Simple::new(
         None,                             // default server
         "screenpipe",                     // app name
@@ -343,7 +358,7 @@ fn create_pulse_record_stream(
         "audio-capture",                  // stream description
         &spec,                            // sample format
         None,                             // default channel map
-        None,                             // default buffering
+        Some(&buffer_attr),               // small fragsize: deliver ~50ms fragments continuously
     )
     .map_err(|e| {
         anyhow!(
