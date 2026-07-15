@@ -1,13 +1,14 @@
 {
   "_comment": "screenpipe local buffered processor. All caps are IN-CODE (no systemd dependency). Times are LOCAL.",
 
-  "db": "/mnt/data/screenpipe-agent/db.sqlite",
+  "db": "/opt/screenpipe-agent/db.sqlite",
   "whisper_url": "http://10.10.0.2:9000/v1/audio/transcriptions",
 
   "tasks": {
     "a11y_harvest": { "enabled": true },
     "audio":        { "enabled": true, "silence_bytes": 6000, "silence_db": -40.0, "min_voiced_seconds": 5.0, "silence_noise_db": "-30dB", "settle_seconds": 150 },
-    "ocr":          { "enabled": true, "lang": "eng", "settle_seconds": 150,
+    "_ocr_note":    "DISABLED 2026-06-18: central (screenpipe-central.service, CENTRAL_OCR_BACKEND=tesseract, fed RAW frames via SHIM_RAW=true) is the canonical & SOLE image-OCR site. This client-side tesseract task duplicated central's OCR on the same frames (~1 core on the desktop). a11y_harvest (free a11y text) stays on for local :3030 search of a11y-rich frames; image-only frames are searchable via central only.",
+    "ocr":          { "enabled": false, "lang": "eng", "settle_seconds": 150,
                       "video_extract": true, "video_extract_only_in_catchup": true }
   },
 
