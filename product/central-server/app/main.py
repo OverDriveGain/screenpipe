@@ -21,9 +21,9 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from . import config, embedding, operator, retention, worker
+from . import asr, config, embedding, live, operator, retention, worker
 from .auth import AgentDep
-from .db import Agent, AudioChunk, Frame, FrameEmbedding, OcrText, SessionLocal, bootstrap
+from .db import Agent, AudioChunk, AudioTranscription, Frame, FrameEmbedding, OcrText, SessionLocal, bootstrap
 from .images import make_thumbnail
 from .operator import require_operator
 from .schemas import (
@@ -31,6 +31,8 @@ from .schemas import (
     AgentSummary,
     IngestAudioRequest,
     IngestAudioResponse,
+    IngestAudioStreamRequest,
+    IngestAudioStreamResponse,
     IngestRequest,
     IngestResponse,
     OperatorLogin,
@@ -38,6 +40,8 @@ from .schemas import (
     SearchResponse,
     TimelineFrame,
     TimelineResponse,
+    TranscriptItem,
+    TranscriptsResponse,
 )
 from .store import audio_key, raw_frame_key, store, thumbnail_key
 
@@ -59,6 +63,10 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="screenpipe central", version="0.1.0", lifespan=lifespan)
+
+# Live mic-listen relay: WS /live/agent/{id} (agent token) + /live/listen/{id}
+# (operator cookie). Registered as a router so the WS endpoints share the app.
+app.include_router(live.router)
 
 # CORS: the viewer SPA in dev runs on a separate origin (Vite :5173) and sends
 # the session cookie, so allow_credentials must be True and origins explicit
@@ -255,6 +263,130 @@ async def ingest_audio(req: IngestAudioRequest, agent: Agent = AgentDep):
     return IngestAudioResponse(accepted=accepted, duplicates=duplicates, max_source_chunk_id=max_stored)
 
 
+@app.post("/ingest-audio-stream", response_model=IngestAudioStreamResponse)
+async def ingest_audio_stream(req: IngestAudioStreamRequest, agent: Agent = AgentDep):
+    """Realtime streaming ASR ingest (Stage 2). The agent's live-audio tap pushes a
+    short VAD-bounded voiced segment (16kHz mono PCM16 WAV); we transcribe it on the
+    GPU IMMEDIATELY and store the transcript, so it is queryable within ~1-3s of the
+    utterance instead of waiting ~30-60s for the 30s-chunk batch path.
+
+    The transcript is stored as a synthesized audio_chunks row with a NEGATIVE
+    source_chunk_id (so it never collides with the positive 30s-chunk cursor and the
+    shim's max_source_chunk_id math is unaffected) + no audio_key (the durable raw
+    audio lives in the 30s-chunk archive; we keep only the transcript here). It then
+    shows up in /transcripts exactly like any other transcript."""
+    if req.agent_id != agent.agent_key:
+        raise HTTPException(403, "agent_id does not match token identity")
+
+    raw = base64.b64decode(req.audio_b64)
+    try:
+        text_out = await asyncio.to_thread(asr.transcribe, raw, "segment.wav")
+    except asr.AsrError as e:
+        raise HTTPException(502, f"ASR failed: {e}")
+
+    ts = _parse_ts(req.started_at) or dt.datetime.now(dt.timezone.utc)
+    accepted = False
+    if len(text_out) >= config.ASR_MIN_CHARS:
+        neg_id = -int(ts.timestamp() * 1000)
+        async with SessionLocal() as session:
+            new_id = (
+                await session.execute(
+                    pg_insert(AudioChunk)
+                    .values(
+                        agent_id=agent.id,
+                        source_chunk_id=neg_id,
+                        timestamp=ts,
+                        audio_key=None,
+                        asr_status="done",
+                    )
+                    .on_conflict_do_nothing(index_elements=["agent_id", "source_chunk_id"])
+                    .returning(AudioChunk.id)
+                )
+            ).scalar_one_or_none()
+            if new_id is not None:
+                vec = embedding.embed(text_out)
+                await session.execute(
+                    pg_insert(AudioTranscription)
+                    .values(chunk_id=new_id, text=text_out, embedding=vec)
+                    .on_conflict_do_update(index_elements=["chunk_id"], set_={"text": text_out, "embedding": vec})
+                )
+                accepted = True
+            agent_row = await session.get(Agent, agent.id)
+            agent_row.last_seen_at = dt.datetime.now(dt.timezone.utc)
+            await session.commit()
+
+    return IngestAudioStreamResponse(accepted=accepted, text_len=len(text_out), text=text_out)
+
+
+@app.get("/transcripts", response_model=TranscriptsResponse)
+async def transcripts(
+    agent_id: Optional[str] = Query(None),
+    since: Optional[str] = Query(None, description="ISO8601 lower bound on timestamp"),
+    until: Optional[str] = Query(None, description="ISO8601 upper bound on timestamp"),
+    q: Optional[str] = Query(None, description="optional full-text query over the transcript"),
+    limit: int = Query(60, ge=1, le=500),
+    order: str = Query("desc", pattern="^(asc|desc)$"),
+    _op: str = OperatorDep,
+):
+    """Read audio transcripts (both realtime streaming segments and 30s-chunk batch)
+    for the viewer / AI consumer. Time-filterable, optional full-text query. This is
+    the audio counterpart to /timeline+/search, which cover frames/OCR only."""
+    since_dt = _parse_ts(since)
+    until_dt = _parse_ts(until)
+
+    params: dict = {"limit": limit}
+    where = ["1=1"]
+    async with SessionLocal() as session:
+        if agent_id:
+            a = (await session.execute(select(Agent.id).where(Agent.agent_key == agent_id))).scalar_one_or_none()
+            if a is None:
+                return TranscriptsResponse(agent_id=agent_id, total=0, transcripts=[])
+            where.append("ac.agent_id = :agent_id")
+            params["agent_id"] = a
+        if since_dt is not None:
+            where.append("ac.timestamp >= :since")
+            params["since"] = since_dt
+        if until_dt is not None:
+            where.append("ac.timestamp <= :until")
+            params["until"] = until_dt
+
+        score_sel = "NULL AS score"
+        order_sql = f"ac.timestamp {'ASC' if order == 'asc' else 'DESC'}"
+        if q:
+            lang = config.FTS_LANGUAGE.replace("'", "")
+            params["q"] = q
+            where.append(f"t.tsv @@ plainto_tsquery('{lang}', :q)")
+            score_sel = f"ts_rank(t.tsv, plainto_tsquery('{lang}', :q)) AS score"
+            order_sql = "score DESC"
+
+        sql = text(
+            f"""
+            SELECT a.agent_key, ac.timestamp, t.text,
+                   CASE WHEN ac.source_chunk_id < 0 THEN 'stream' ELSE 'chunk' END AS source,
+                   {score_sel}
+            FROM audio_transcriptions t
+            JOIN audio_chunks ac ON ac.id = t.chunk_id
+            JOIN agents a ON a.id = ac.agent_id
+            WHERE {' AND '.join(where)}
+            ORDER BY {order_sql}
+            LIMIT :limit
+            """
+        )
+        rows = (await session.execute(sql, params)).all()
+
+    items = [
+        TranscriptItem(
+            agent_id=r[0],
+            timestamp=r[1],
+            text=r[2] or "",
+            source=r[3],
+            score=float(r[4]) if r[4] is not None else None,
+        )
+        for r in rows
+    ]
+    return TranscriptsResponse(agent_id=agent_id, total=len(items), transcripts=items)
+
+
 @app.get("/search", response_model=SearchResponse)
 async def search(
     q: str = Query(..., description="search query"),
@@ -421,6 +553,57 @@ async def list_agents(_op: str = OperatorDep):
                 )
             )
     return AgentListResponse(agents=summaries)
+
+
+@app.get("/live/status/{agent_id}")
+async def live_status(agent_id: str, _op: str = OperatorDep):
+    """Whether an agent's live mic-listen channel is available (the agent has
+    dialed in) and whether it's currently being listened to. Drives the viewer's
+    "Listen now" button enable/disable + "busy" state."""
+    sess = live.registry.get(agent_id)
+    online = bool(sess and sess.agent_ws is not None)
+    busy = bool(sess and sess.listener_ws is not None)
+    return {
+        "agent_id": agent_id,
+        "live_enabled": config.LIVE_ENABLED,
+        "agent_online": online,
+        "busy": busy,
+        "codec": (sess.hello.get("codec") if sess else None),
+        "sample_rate": (sess.hello.get("sample_rate") if sess else None),
+        "max_seconds": config.LIVE_MAX_DURATION_SECONDS,
+    }
+
+
+@app.get("/live/sessions")
+async def live_sessions(
+    agent_id: Optional[str] = Query(None),
+    limit: int = Query(100, le=500),
+    _op: str = OperatorDep,
+):
+    """Audit log of live mic-listen sessions (who/when/which agent/duration)."""
+    from .db import LiveSession
+
+    async with SessionLocal() as session:
+        stmt = select(LiveSession).order_by(LiveSession.started_at.desc()).limit(limit)
+        if agent_id:
+            stmt = select(LiveSession).where(LiveSession.agent_key == agent_id).order_by(
+                LiveSession.started_at.desc()
+            ).limit(limit)
+        rows = (await session.execute(stmt)).scalars().all()
+        return {
+            "sessions": [
+                {
+                    "id": r.id,
+                    "agent_id": r.agent_key,
+                    "operator": r.operator,
+                    "started_at": r.started_at.isoformat() if r.started_at else None,
+                    "ended_at": r.ended_at.isoformat() if r.ended_at else None,
+                    "duration_seconds": r.duration_seconds,
+                    "end_reason": r.end_reason,
+                }
+                for r in rows
+            ]
+        }
 
 
 @app.get("/timeline", response_model=TimelineResponse)

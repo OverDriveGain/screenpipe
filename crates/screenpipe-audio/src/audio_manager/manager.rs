@@ -31,7 +31,7 @@ use crate::{
     },
     device::device_manager::DeviceManager,
     meeting_detector::MeetingDetector,
-    meeting_streaming::{start_meeting_streaming_loop, MeetingAudioTap},
+    meeting_streaming::{start_meeting_streaming_loop, MeetingAudioFrame, MeetingAudioTap},
     metrics::AudioPipelineMetrics,
     segmentation::segmentation_manager::SegmentationManager,
     transcription::{
@@ -614,6 +614,38 @@ impl AudioManager {
     /// Returns whether to follow system default audio devices
     pub async fn use_system_default_audio(&self) -> bool {
         self.options.read().await.use_system_default_audio
+    }
+
+    /// Subscribe to the live, low-latency audio tap for on-demand operator
+    /// "Listen now". Returns a broadcast receiver of `MeetingAudioFrame`s drained
+    /// straight from the per-device recorders (each frame carries device_name +
+    /// device_type + sample_rate, so the caller can filter to mic input only).
+    ///
+    /// IMPORTANT: subscribing alone does NOT make frames flow — the recorder only
+    /// forwards frames while the tap is "active". Call `start_live_listen()` to
+    /// register a listener (increments the live-listener gate) and
+    /// `stop_live_listen()` when done. Frames flow even with
+    /// `--audio-transcription-engine disabled` because capture + tap always run;
+    /// only STT is short-circuited.
+    pub fn subscribe_live_audio(&self) -> broadcast::Receiver<MeetingAudioFrame> {
+        self.meeting_audio_tap.subscribe()
+    }
+
+    /// Register an on-demand live listener so the recorders begin forwarding
+    /// low-latency frames to the tap. Returns the new listener count. Independent
+    /// of meeting streaming. Pair every call with exactly one `stop_live_listen()`.
+    pub fn start_live_listen(&self) -> usize {
+        self.meeting_audio_tap.add_live_listener()
+    }
+
+    /// Deregister an on-demand live listener. Returns the remaining count.
+    pub fn stop_live_listen(&self) -> usize {
+        self.meeting_audio_tap.remove_live_listener()
+    }
+
+    /// Number of currently-attached on-demand live listeners.
+    pub fn live_listener_count(&self) -> usize {
+        self.meeting_audio_tap.live_listener_count()
     }
 
     async fn record_device(&self, device: &AudioDevice) -> Result<JoinHandle<Result<()>>> {

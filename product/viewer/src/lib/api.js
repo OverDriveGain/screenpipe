@@ -44,4 +44,26 @@ export const api = {
     if (until) p.set('until', until)
     return req(`/search?${p.toString()}`)
   },
+  // Audio transcripts (realtime streaming + legacy 30s-chunk). q is optional FTS.
+  transcripts: ({ agentId, q, since, until, order = 'desc', limit = 100 }) => {
+    const p = new URLSearchParams({ order, limit })
+    if (agentId) p.set('agent_id', agentId)
+    if (q) p.set('q', q)
+    if (since) p.set('since', since)
+    if (until) p.set('until', until)
+    return req(`/transcripts?${p.toString()}`)
+  },
+  // Live mic-listen ("Listen now").
+  liveStatus: (agentId) => req(`/live/status/${encodeURIComponent(agentId)}`),
+  liveSessions: (agentId) => {
+    const p = agentId ? `?agent_id=${encodeURIComponent(agentId)}` : ''
+    return req(`/live/sessions${p}`)
+  },
+}
+
+// WebSocket URL for the operator listen channel, same-origin (cookie rides the
+// upgrade). http(s) -> ws(s).
+export function liveListenWsUrl(agentId) {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
+  return `${proto}//${location.host}/live/listen/${encodeURIComponent(agentId)}`
 }

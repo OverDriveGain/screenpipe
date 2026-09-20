@@ -24,8 +24,12 @@ export default defineConfig({
       '/agents': apiTarget,
       '/timeline': apiTarget,
       '/search': apiTarget,
+      '/transcripts': apiTarget,
       '/health': apiTarget,
       '/thumbnails': apiTarget,
+      // Live mic-listen: /live/status + /live/sessions are HTTP; /live/listen is
+      // a WebSocket upgrade — ws:true makes Vite proxy the upgrade too.
+      '/live': { target: apiTarget, ws: true },
     },
   },
 })

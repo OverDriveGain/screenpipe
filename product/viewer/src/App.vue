@@ -8,12 +8,13 @@ import { ref, reactive, onMounted, computed } from 'vue'
 import { api } from './lib/api.js'
 import Login from './components/Login.vue'
 import FrameCard from './components/FrameCard.vue'
+import LiveListen from './components/LiveListen.vue'
 
 const authed = ref(false)
 const booting = ref(true)
 const agents = ref([])
 const selected = ref(null)
-const tab = ref('timeline') // 'timeline' | 'search'
+const tab = ref('timeline') // 'timeline' | 'search' | 'audio'
 const zoomUrl = ref(null)
 const error = ref('')
 
@@ -21,6 +22,8 @@ const error = ref('')
 const tl = reactive({ frames: [], total: 0, loading: false, offset: 0, limit: 60, order: 'desc' })
 // search state
 const se = reactive({ q: '', mode: 'hybrid', hits: [], loading: false, ran: false })
+// audio transcripts state
+const au = reactive({ q: '', items: [], loading: false, order: 'desc' })
 // shared time filters (datetime-local strings)
 const filt = reactive({ since: '', until: '' })
 
@@ -73,6 +76,7 @@ function selectAgent(a) {
   selected.value = a
   tl.offset = 0
   if (tab.value === 'timeline') loadTimeline()
+  else if (tab.value === 'audio') loadTranscripts()
   else if (se.ran) runSearch()
 }
 
@@ -122,9 +126,32 @@ async function runSearch() {
   }
 }
 
+async function loadTranscripts() {
+  if (!selected.value) return
+  au.loading = true
+  error.value = ''
+  try {
+    const r = await api.transcripts({
+      agentId: selected.value.agent_id,
+      q: au.q.trim() || undefined,
+      since: toIso(filt.since),
+      until: toIso(filt.until),
+      order: au.order,
+      limit: 200,
+    })
+    au.items = r.transcripts
+  } catch (e) {
+    if (e.status === 401) { authed.value = false; return }
+    error.value = e.message
+  } finally {
+    au.loading = false
+  }
+}
+
 function switchTab(t) {
   tab.value = t
   if (t === 'timeline') loadTimeline()
+  else if (t === 'audio') loadTranscripts()
 }
 
 function pageTimeline(delta) {
@@ -153,6 +180,7 @@ onMounted(boot)
     <div class="topbar">
       <h1>Activity Viewer</h1>
       <span class="muted">{{ selected ? selected.display_name || selected.agent_id : 'no agent' }}</span>
+      <LiveListen v-if="selected" :key="selected.agent_id" :agent-id="selected.agent_id" style="margin-left:16px" />
       <div style="margin-left:auto"><button @click="logout">Sign out</button></div>
     </div>
 
@@ -177,6 +205,7 @@ onMounted(boot)
         <div class="tabs">
           <button class="tab" :class="{ active: tab==='timeline' }" @click="switchTab('timeline')">Timeline</button>
           <button class="tab" :class="{ active: tab==='search' }" @click="switchTab('search')">Search</button>
+          <button class="tab" :class="{ active: tab==='audio' }" @click="switchTab('audio')">Audio</button>
         </div>
 
         <div class="controls">
@@ -191,6 +220,19 @@ onMounted(boot)
                 <option value="hybrid">hybrid</option>
                 <option value="vector">semantic</option>
                 <option value="fts">full-text</option>
+              </select>
+            </div>
+          </template>
+          <template v-else-if="tab==='audio'">
+            <div class="field" style="flex:1; min-width:220px">
+              <label>Search transcript</label>
+              <input v-model="au.q" placeholder="filter audio text… (blank = latest)" @keyup.enter="loadTranscripts" />
+            </div>
+            <div class="field">
+              <label>Order</label>
+              <select v-model="au.order" @change="loadTranscripts">
+                <option value="desc">newest first</option>
+                <option value="asc">oldest first</option>
               </select>
             </div>
           </template>
@@ -215,6 +257,9 @@ onMounted(boot)
           <button v-if="tab==='search'" class="primary" @click="runSearch" :disabled="se.loading">
             {{ se.loading ? 'Searching…' : 'Search' }}
           </button>
+          <button v-else-if="tab==='audio'" class="primary" @click="loadTranscripts" :disabled="au.loading">
+            {{ au.loading ? 'Loading…' : 'Apply' }}
+          </button>
           <button v-else class="primary" @click="tl.offset=0; loadTimeline()" :disabled="tl.loading">
             {{ tl.loading ? 'Loading…' : 'Apply' }}
           </button>
@@ -236,11 +281,23 @@ onMounted(boot)
         </template>
 
         <!-- Search -->
-        <template v-else>
+        <template v-else-if="tab==='search'">
           <div v-if="se.ran && !se.loading && !se.hits.length" class="empty">No matches.</div>
           <div class="grid">
             <FrameCard v-for="(h,i) in se.hits" :key="h.source_frame_id + '-' + i" :frame="h" :show-score="true" @zoom="zoomUrl=$event" />
           </div>
+        </template>
+
+        <!-- Audio transcripts -->
+        <template v-else-if="tab==='audio'">
+          <div v-if="!au.loading && !au.items.length" class="empty">No transcripts in this range.</div>
+          <ul class="transcripts">
+            <li v-for="(t,i) in au.items" :key="i" class="tr">
+              <span class="tr-time">{{ t.timestamp ? new Date(t.timestamp).toLocaleString() : '—' }}</span>
+              <span class="tr-src" :class="t.source">{{ t.source === 'stream' ? 'live' : 'chunk' }}</span>
+              <span class="tr-text">{{ t.text }}</span>
+            </li>
+          </ul>
         </template>
       </main>
     </div>

@@ -96,6 +96,10 @@ OCR_PROMPT: str = _env(
 WORKER_ENABLED: bool = _env("CENTRAL_WORKER_ENABLED", "1") == "1"
 WORKER_BATCH: int = int(_env("CENTRAL_WORKER_BATCH", "8"))
 WORKER_IDLE_SLEEP: float = float(_env("CENTRAL_WORKER_IDLE_SLEEP", "3"))
+# The frame OCR loop runs on its OWN task (decoupled from audio) so a slow batch
+# of GPU transcriptions can never delay screen-text visibility. It polls fast when
+# idle so freshly-synced frames are OCR'd and queryable in ~1-3s (realtime target).
+WORKER_FRAME_IDLE_SLEEP: float = float(_env("CENTRAL_WORKER_FRAME_IDLE_SLEEP", "0.25"))
 # Thumbnail derived from the raw frame for the viewer (px width / JPEG quality).
 THUMBNAIL_WIDTH: int = int(_env("CENTRAL_THUMBNAIL_WIDTH", "960"))
 THUMBNAIL_QUALITY: int = int(_env("CENTRAL_THUMBNAIL_QUALITY", "60"))
@@ -131,3 +135,10 @@ OPERATOR_PASSWORD: str = _env("CENTRAL_OPERATOR_PASSWORD", "changeme")
 SESSION_SECRET: str = _env("CENTRAL_SESSION_SECRET", "dev-insecure-session-secret-change-me")
 # Session lifetime in seconds (default 12h).
 SESSION_TTL: int = int(_env("CENTRAL_SESSION_TTL", "43200"))
+
+# --- Live mic-listen ("Listen now") -----------------------------------------
+# On-demand only, one listener per agent. The max-duration backstop force-ends a
+# session even if the operator never clicks Stop / leaves the tab open (a forgotten
+# open tab must not become 24/7 monitoring — legal posture). Default 30 minutes.
+LIVE_ENABLED: bool = _env("CENTRAL_LIVE_ENABLED", "1") == "1"
+LIVE_MAX_DURATION_SECONDS: int = int(_env("CENTRAL_LIVE_MAX_DURATION_SECONDS", "1800"))

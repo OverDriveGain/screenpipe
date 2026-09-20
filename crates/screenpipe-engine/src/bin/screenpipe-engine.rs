@@ -1515,6 +1515,16 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         });
+
+        // On-demand live mic-listen ("Listen now"): spawn the outbound WSS dialer
+        // to central. No-op unless SCREENPIPE_LIVE_CENTRAL_URL is configured. The
+        // mic tap stays inactive until central relays an operator start.
+        screenpipe_engine::live_audio::spawn(audio_manager.clone());
+
+        // Always-on realtime streaming ASR: tap live audio, VAD-segment, push each
+        // voiced segment to central for immediate transcription (~1-3s vs the 30s
+        // chunk path). No-op unless SCREENPIPE_STREAM_ASR_URL is configured.
+        screenpipe_engine::stream_asr::spawn(audio_manager.clone());
     }
 
     // Start UI event recording (database recording of accessibility events)

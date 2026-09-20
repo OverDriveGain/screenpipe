@@ -154,6 +154,31 @@ class AudioTranscription(Base):
     chunk: Mapped["AudioChunk"] = relationship(back_populates="transcription")
 
 
+class LiveSession(Base):
+    """Audit row per on-demand "Listen now" live mic-listen session.
+
+    One row is created when an operator starts listening to an agent and updated
+    (ended_at + duration) when the session stops (operator clicks Stop / closes
+    the tab / max-duration backstop / agent disconnect). This is the legal audit
+    trail (who listened to whom, when, for how long) — disclosed-in-policy posture.
+    """
+
+    __tablename__ = "live_sessions"
+    __table_args__ = (Index("ix_live_sessions_started", "started_at"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    agent_id: Mapped[int] = mapped_column(ForeignKey("agents.id", ondelete="CASCADE"), index=True)
+    # The agent_key string, denormalised so the audit row survives agent deletion-by-key reads.
+    agent_key: Mapped[str] = mapped_column(String(128), index=True)
+    # Operator username (single shared operator for v1).
+    operator: Mapped[str] = mapped_column(String(128))
+    started_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    ended_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
+    duration_seconds: Mapped[Optional[int]] = mapped_column(Integer)
+    # Why the session ended: 'operator_stop' | 'max_duration' | 'agent_disconnect' | 'listener_gone'
+    end_reason: Mapped[Optional[str]] = mapped_column(String(32))
+
+
 # Raw DDL run after create_all: pgvector extension, tsvector generated column,
 # the GIN index for FTS, and an ivfflat index for vector search.
 #

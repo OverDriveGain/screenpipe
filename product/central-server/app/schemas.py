@@ -67,6 +67,39 @@ class IngestAudioResponse(BaseModel):
     max_source_chunk_id: Optional[int] = None
 
 
+class IngestAudioStreamRequest(BaseModel):
+    """One short VAD-bounded voiced segment pushed by the agent's live-audio tap
+    for realtime transcription (Stage 2 streaming ASR). Unlike the 30s chunk path,
+    these are transcribed the instant they arrive so the transcript is queryable
+    within ~1-3s of the utterance instead of ~30-60s."""
+
+    agent_id: str = Field(..., description="stable agent key; must match the token's agent")
+    started_at: Optional[str] = Field(None, description="ISO8601 start time of the voiced segment")
+    duration_ms: Optional[int] = Field(None, description="segment length in ms (for logging)")
+    audio_b64: str = Field(..., description="base64 audio bytes (16kHz mono PCM16 WAV)")
+    audio_mime: str = "audio/wav"
+
+
+class IngestAudioStreamResponse(BaseModel):
+    accepted: bool = Field(..., description="true if a transcript row was written")
+    text_len: int = 0
+    text: str = Field("", description="the transcript (echoed back for the agent's debug log)")
+
+
+class TranscriptItem(BaseModel):
+    agent_id: str
+    timestamp: Optional[dt.datetime]
+    text: str
+    source: str = Field(..., description="'stream' (realtime VAD segment) | 'chunk' (30s batch)")
+    score: Optional[float] = Field(None, description="FTS/vector rank when q is given")
+
+
+class TranscriptsResponse(BaseModel):
+    agent_id: Optional[str]
+    total: int
+    transcripts: list[TranscriptItem]
+
+
 class SearchHit(BaseModel):
     agent_id: str
     source_frame_id: int

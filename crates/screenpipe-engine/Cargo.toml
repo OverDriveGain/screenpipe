@@ -59,6 +59,15 @@ tokio = { version = "1.15", features = ["full", "tracing"] }
 tokio-stream = "0.1"
 tower-http = { version = "0.5.2", features = ["cors", "trace"] }
 
+# Live-audio outbound dialer (operator "Listen now"): agent dials WSS out to
+# central. tokio-tungstenite with rustls matches the reqwest TLS stack already
+# in the tree. Codec is pluggable: the MVP ships raw PCM16-LE @ 16 kHz mono
+# (zero C deps, proves the chain locally first per Manar). The `live-opus`
+# feature swaps in libopus (audiopus) for the bandwidth-efficient prod transport
+# once a libopus/autotools build env is provisioned on the agents (Windows too).
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+audiopus = { version = "0.2", optional = true }
+
 # Log
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -154,6 +163,10 @@ criterion = { workspace = true }
 # it, `cargo {check,clippy,build} -p screenpipe-engine` (no --features) fails
 # to compile. Mac/Win release builds layer redact-onnx-{coreml,directml} on top.
 default = ["qwen3-asr", "parakeet", "redact-onnx-cpu"]
+# Opus-encode the live mic-listen stream instead of raw PCM16. Needs libopus +
+# autotools (or system Opus via pkg-config) on the build host — and on the
+# target if not statically vendored. Off by default so the MVP builds clean.
+live-opus = ["dep:audiopus"]
 metal = ["screenpipe-audio/metal"]
 heap-prof = ["dhat"]
 cuda = ["screenpipe-audio/cuda"]
